@@ -25,14 +25,23 @@ BUSINESS_CONFIG = {
     'delivery_cost': os.getenv('DELIVERY_COST_OUTSIDE', '15')
 }
 
-# Cliente Groq
-client = Groq(api_key=GROQ_API_KEY)
+# Cliente Groq con manejo de errores
+try:
+    client = Groq(api_key=GROQ_API_KEY)
+    print("Groq client initialized successfully")
+except Exception as e:
+    print(f"Error initializing Groq: {e}")
+    client = None
 
 # Almacenamiento temporal de conversaciones (en producción usar base de datos)
 conversations = {}
 
 def get_ai_response(user_message, user_id):
     """Genera respuesta usando Groq AI"""
+    
+    # Verificar si el cliente está disponible
+    if client is None:
+        return "Disculpa, el servicio de respuestas automáticas no está disponible en este momento. Por favor contacta por WhatsApp."
     
     # Obtener historial de conversación
     if user_id not in conversations:
@@ -50,7 +59,7 @@ Información de tu negocio:
 
 INSTRUCCIONES IMPORTANTES:
 1. Responde de manera natural y conversacional, como una persona real
-2. Sé amable pero directo
+2. Sé directo
 3. Solo proporciona el WhatsApp cuando el cliente esté listo para comprar
 4. Si preguntan por ubicación para envío, da el WhatsApp para coordinar
 5. Mantén respuestas cortas y naturales
@@ -158,13 +167,23 @@ def test():
     return jsonify({
         "status": "Bot funcionando correctamente",
         "business": BUSINESS_CONFIG['name'],
-        "product": BUSINESS_CONFIG['product']
+        "product": BUSINESS_CONFIG['product'],
+        "groq_status": "connected" if client else "disconnected"
     })
 
 @app.route('/conversations', methods=['GET'])
 def get_conversations():
     """Ver conversaciones activas (para debug)"""
     return jsonify(conversations)
+
+@app.route('/', methods=['GET'])
+def home():
+    """Página de inicio"""
+    return jsonify({
+        "message": "Bot de Marketplace funcionando",
+        "status": "online",
+        "business": BUSINESS_CONFIG['name']
+    })
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
