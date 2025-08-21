@@ -5,12 +5,20 @@ import logging
 import re
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, render_template_string
-from groq import Groq
 import requests
 from dotenv import load_dotenv
 from functools import wraps
 import time
 from collections import defaultdict
+
+# Importar Groq con manejo de errores
+try:
+    from groq import Groq
+    GROQ_AVAILABLE = True
+except ImportError:
+    GROQ_AVAILABLE = False
+    logger = logging.getLogger(__name__)
+    logger.warning("Groq no disponible, usando solo respuestas programadas")
 
 # Configurar logging
 logging.basicConfig(
@@ -279,17 +287,9 @@ class DatabaseManager:
 # Inicializar base de datos
 db = DatabaseManager()
 
-# Cliente Groq - REACTIVADO con versión compatible
+# Forzar solo respuestas programadas (más confiable)
 client = None
-if GROQ_API_KEY:
-    try:
-        client = Groq(api_key=GROQ_API_KEY)
-        logger.info("✅ Groq client initialized successfully")
-    except Exception as e:
-        logger.error(f"⚠️ Error with Groq (using fallback): {e}")
-        client = None
-else:
-    logger.warning("⚠️ GROQ_API_KEY not found - using fallback responses")
+logger.info("🎯 Usando SOLO respuestas programadas para máxima confiabilidad")
 
 def extract_phone_number(message):
     """Extraer número de teléfono del mensaje"""
@@ -341,13 +341,25 @@ def get_objective_response(user_message, user_id):
     if any(word in message_lower for word in ['hola', 'buenos', 'buenas', 'hey']):
         return "Hola! ¿Qué producto necesitas?"
     
-    elif any(word in message_lower for word in ['taper', 'tupper', 'contenedor', 'recipiente']):
+    elif any(word in message_lower for word in [
+        'taper', 'tapper', 'tappers', 'tupper', 'tuppers', 'tupperware',
+        'contenedor', 'contenedores', 'recipiente', 'recipientes', 
+        'envase', 'envases', 'hermetico', 'hermeticos', 
+        'guardar comida', 'almacenar', 'cocina'
+    ]):
+        logger.info(f"Detectado producto TAPPERS en mensaje: {message_lower}")
         return "Sí"
     
-    elif any(word in message_lower for word in ['vaso', 'copa']):
+    elif any(word in message_lower for word in [
+        'vaso', 'vasos', 'copa', 'copas', 'beber', 'tomar', 'plastico para beber'
+    ]):
+        logger.info(f"Detectado producto VASOS en mensaje: {message_lower}")
         return "Sí"
     
-    elif any(word in message_lower for word in ['plato']):
+    elif any(word in message_lower for word in [
+        'plato', 'platos', 'vajilla', 'servir', 'comer', 'plastico para comer'
+    ]):
+        logger.info(f"Detectado producto PLATOS en mensaje: {message_lower}")
         return "Sí"
     
     elif any(word in message_lower for word in ['precio', 'cuanto', 'cuesta', 'valor', 'a cuanto', 'estan']):
@@ -358,14 +370,22 @@ def get_objective_response(user_message, user_id):
         # Debug: mostrar la conversación para entender
         logger.info(f"Historial conversación para {user_id}: {full_conversation}")
         
-        # Buscar menciones de productos en orden de prioridad
-        if any(word in full_conversation for word in ['taper', 'tupper', 'contenedor', 'recipiente']):
+        # Buscar menciones de productos en orden de prioridad (más palabras)
+        if any(word in full_conversation for word in [
+            'taper', 'tapper', 'tappers', 'tupper', 'tuppers', 'tupperware',
+            'contenedor', 'contenedores', 'recipiente', 'recipientes', 
+            'envase', 'envases', 'hermetico', 'guardar comida'
+        ]):
             logger.info(f"Detectado producto: Tappers")
             return "35 bs"
-        elif any(word in full_conversation for word in ['vaso', 'copa']):
+        elif any(word in full_conversation for word in [
+            'vaso', 'vasos', 'copa', 'copas', 'beber', 'tomar'
+        ]):
             logger.info(f"Detectado producto: Vasos")
             return "12 bs"
-        elif any(word in full_conversation for word in ['plato']):
+        elif any(word in full_conversation for word in [
+            'plato', 'platos', 'vajilla', 'servir', 'comer'
+        ]):
             logger.info(f"Detectado producto: Platos")
             return "20 bs"
         else:
@@ -401,7 +421,9 @@ def get_objective_response(user_message, user_id):
         return "Sí hay"
     
     else:
-        return "¿En qué le puedo ayudar?"
+        # Si no reconoce nada específico, mostrar catálogo
+        logger.info(f"Mensaje no reconocido: {message_lower} - Mostrando catálogo")
+        return "Tappers, vasos, platos. ¿Qué necesita?"
 
 def get_enhanced_ai_response(user_message, user_id):
     """Respuesta con IA súper objetiva"""
