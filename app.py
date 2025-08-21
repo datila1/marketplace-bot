@@ -309,6 +309,9 @@ def get_objective_response(user_message, user_id):
     """Respuestas objetivas y directas orientadas a venta"""
     message_lower = user_message.lower()
     
+    # Debug: log para entender qué está pasando
+    logger.info(f"Procesando mensaje: '{user_message}' de usuario {user_id}")
+    
     # Extraer teléfono si lo proporciona
     phone = extract_phone_number(user_message)
     if phone:
@@ -345,18 +348,27 @@ def get_objective_response(user_message, user_id):
     elif any(word in message_lower for word in ['plato']):
         return "Sí"
     
-    elif any(word in message_lower for word in ['precio', 'cuanto', 'cuesta', 'valor']):
-        # Verificar qué producto mencionaron en la conversación
-        conversation = db.get_conversation_history(user_id, 5)
-        full_conversation = " ".join([msg["content"] for msg in conversation])
+    elif any(word in message_lower for word in ['precio', 'cuanto', 'cuesta', 'valor', 'a cuanto']):
+        # Verificar qué producto mencionaron en la conversación reciente
+        conversation = db.get_conversation_history(user_id, 8)
+        full_conversation = " ".join([msg["content"] for msg in conversation]).lower()
         
-        if any(word in full_conversation.lower() for word in ['taper', 'tupper']):
+        # Debug: mostrar la conversación para entender
+        logger.info(f"Historial conversación para {user_id}: {full_conversation}")
+        
+        # Buscar menciones de productos en orden de prioridad
+        if any(word in full_conversation for word in ['taper', 'tupper', 'contenedor', 'recipiente']):
+            logger.info(f"Detectado producto: Tappers")
             return "35 bs"
-        elif any(word in full_conversation.lower() for word in ['vaso', 'copa']):
+        elif any(word in full_conversation for word in ['vaso', 'copa']):
+            logger.info(f"Detectado producto: Vasos")
             return "12 bs"
-        elif any(word in full_conversation.lower() for word in ['plato']):
+        elif any(word in full_conversation for word in ['plato']):
+            logger.info(f"Detectado producto: Platos")
             return "20 bs"
         else:
+            # Si pregunta precio pero no hay contexto de producto
+            logger.info(f"No se detectó producto en conversación")
             return "¿De qué producto?"
     
     elif any(word in message_lower for word in ['menos', 'descuento', 'rebaja', 'barato', 'nada menos']):
