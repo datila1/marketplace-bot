@@ -2,8 +2,9 @@ import os
 import json
 import sqlite3
 import logging
+import re
 from datetime import datetime, timedelta
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template_string
 from groq import Groq
 import requests
 from dotenv import load_dotenv
@@ -26,6 +27,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 app = Flask(__name__)
+app.secret_key = os.getenv('SECRET_KEY', 'hogar-mas-secret-key-2024')
 
 # Configuración
 FACEBOOK_ACCESS_TOKEN = os.getenv('FACEBOOK_ACCESS_TOKEN')
@@ -37,26 +39,14 @@ GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 BUSINESS_CONFIG = {
     'name': os.getenv('BUSINESS_NAME', 'Hogar & Más SC'),
     'whatsapp': os.getenv('WHATSAPP_NUMBER', '78056048'),
-    'product': os.getenv('PRODUCT_NAME', 'tappers'),
-    'price': int(os.getenv('PRODUCT_PRICE', '35')),
     'delivery_zone': os.getenv('DELIVERY_ZONE', '4to anillo'),
-    'delivery_cost': int(os.getenv('DELIVERY_COST_OUTSIDE', '15'))
+    'delivery_cost_per_ring': int(os.getenv('DELIVERY_COST_PER_RING', '5')),
+    'owner_phone': os.getenv('OWNER_PHONE', '78056048')  # Tu teléfono para recibir leads
 }
 
 # Rate limiting
 user_requests = defaultdict(list)
-RATE_LIMIT = 10  # máximo 10 mensajes por minuto por usuario
-
-# Cliente Groq con manejo de errores
-try:
-    client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-    if client:
-        logger.info("Groq client initialized successfully")
-    else:
-        logger.warning("Groq API key not found")
-except Exception as e:
-    logger.error(f"Error initializing Groq: {e}")
-    client = None
+RATE_LIMIT = 10
 
 class DatabaseManager:
     def __init__(self, db_path='marketplace_bot.db'):
@@ -67,6 +57,21 @@ class DatabaseManager:
         """Inicializar base de datos SQLite"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
+        
+        # Tabla de productos
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                description TEXT,
+                price REAL NOT NULL,
+                stock INTEGER DEFAULT 0,
+                category TEXT,
+                keywords TEXT,
+                active BOOLEAN DEFAULT TRUE,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
         
         # Tabla de conversaciones
         cursor.execute('''
@@ -86,55 +91,126 @@ class DatabaseManager:
                 user_id TEXT PRIMARY KEY,
                 first_name TEXT,
                 last_name TEXT,
-                profile_pic TEXT,
-                first_interaction DATETIME DEFAULT CURRENT_TIMESTAMP,
+                phone TEXT,
+                address TEXT,
+                purchase_count INTEGER DEFAULT 0,
+                total_spent REAL DEFAULT 0,
                 last_interaction DATETIME DEFAULT CURRENT_TIMESTAMP,
-                total_messages INTEGER DEFAULT 0,
-                status TEXT DEFAULT 'active',
-                phone_requested BOOLEAN DEFAULT FALSE,
-                purchase_intent BOOLEAN DEFAULT FALSE
+                status TEXT DEFAULT 'active'
             )
         ''')
         
-        # Tabla de analytics
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS analytics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_type TEXT NOT NULL,
-                user_id TEXT,
-                data TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Tabla de leads calientes
+        # Tabla de leads calientes (cuando dan teléfono)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS hot_leads (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id TEXT NOT NULL,
-                lead_score INTEGER DEFAULT 0,
-                last_activity DATETIME DEFAULT CURRENT_TIMESTAMP,
-                notes TEXT,
-                contacted BOOLEAN DEFAULT FALSE
+                phone TEXT,
+                products_interested TEXT,
+                conversation_summary TEXT,
+                lead_score INTEGER DEFAULT 5,
+                contacted BOOLEAN DEFAULT FALSE,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Tabla de pedidos
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                phone TEXT,
+                products TEXT,
+                total_amount REAL,
+                delivery_address TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
         conn.commit()
         conn.close()
+        
+        # Insertar productos de ejemplo
+        self.insert_sample_products()
         logger.info("Database initialized successfully")
     
-    def add_message(self, user_id, message, sender, session_id=None):
-        """Agregar mensaje a la base de datos"""
+    def insert_sample_products(self):
+        """Insertar productos de ejemplo"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT COUNT(*) FROM products")
+        count = cursor.fetchone()[0]
+        
+        if count == 0:
+            sample_products = [
+                ('Tappers', 'Tuppers de calidad para almacenar alimentos', 35.0, 100, 'Cocina', 'taper,tupper,contenedor,recipiente', True),
+                ('Vasos Plásticos', 'Vasos resistentes para toda ocasión', 12.0, 50, 'Cocina', 'vaso,copa,plastico', True),
+                ('Platos Plásticos', 'Platos duraderos y coloridos', 20.0, 40, 'Cocina', 'plato,plastico,vajilla', True)
+            ]
+            
+            cursor.executemany(
+                "INSERT INTO products (name, description, price, stock, category, keywords, active) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                sample_products
+            )
+            
+        conn.commit()
+        conn.close()
+    
+    def get_all_products(self, active_only=True):
+        """Obtener todos los productos"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        if active_only:
+            cursor.execute("SELECT * FROM products WHERE active = TRUE AND stock > 0 ORDER BY name")
+        else:
+            cursor.execute("SELECT * FROM products ORDER BY name")
+        
+        products = cursor.fetchall()
+        conn.close()
+        
+        return [
+            {
+                'id': p[0], 'name': p[1], 'description': p[2], 'price': p[3],
+                'stock': p[4], 'category': p[5], 'keywords': p[6], 'active': p[7]
+            } for p in products
+        ]
+    
+    def search_products(self, query):
+        """Buscar productos por nombre o keywords"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        search_term = query.lower()
+        cursor.execute(
+            "SELECT * FROM products WHERE (LOWER(name) LIKE ? OR LOWER(keywords) LIKE ?) AND active = TRUE AND stock > 0",
+            (f"%{search_term}%", f"%{search_term}%")
+        )
+        
+        products = cursor.fetchall()
+        conn.close()
+        
+        return [
+            {
+                'id': p[0], 'name': p[1], 'description': p[2], 'price': p[3],
+                'stock': p[4], 'category': p[5], 'keywords': p[6], 'active': p[7]
+            } for p in products
+        ]
+    
+    def add_message(self, user_id, message, sender):
+        """Agregar mensaje a la conversación"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO conversations (user_id, message, sender, session_id) VALUES (?, ?, ?, ?)",
-            (user_id, message, sender, session_id)
+            "INSERT INTO conversations (user_id, message, sender) VALUES (?, ?, ?)",
+            (user_id, message, sender)
         )
         conn.commit()
         conn.close()
     
-    def get_conversation_history(self, user_id, limit=10):
+    def get_conversation_history(self, user_id, limit=6):
         """Obtener historial de conversación"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -145,7 +221,6 @@ class DatabaseManager:
         messages = cursor.fetchall()
         conn.close()
         
-        # Convertir a formato para Groq
         history = []
         for message, sender in reversed(messages):
             role = "user" if sender == "user" else "assistant"
@@ -153,196 +228,241 @@ class DatabaseManager:
         
         return history
     
-    def update_user(self, user_id, **kwargs):
-        """Actualizar información del usuario"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Verificar si el usuario existe
-        cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
-        exists = cursor.fetchone()
-        
-        if not exists:
-            cursor.execute("INSERT INTO users (user_id) VALUES (?)", (user_id,))
-        
-        # Actualizar campos
-        set_clauses = []
-        values = []
-        for key, value in kwargs.items():
-            set_clauses.append(f"{key} = ?")
-            values.append(value)
-        
-        if set_clauses:
-            values.append(user_id)
-            query = f"UPDATE users SET {', '.join(set_clauses)} WHERE user_id = ?"
-            cursor.execute(query, values)
-        
-        conn.commit()
-        conn.close()
-    
-    def log_analytics(self, event_type, user_id=None, data=None):
-        """Registrar evento de analytics"""
+    def save_hot_lead(self, user_id, phone, products_interested, conversation_summary):
+        """Guardar lead caliente cuando dan teléfono"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO analytics (event_type, user_id, data) VALUES (?, ?, ?)",
-            (event_type, user_id, json.dumps(data) if data else None)
+            "INSERT INTO hot_leads (user_id, phone, products_interested, conversation_summary) VALUES (?, ?, ?, ?)",
+            (user_id, phone, products_interested, conversation_summary)
         )
+        lead_id = cursor.lastrowid
         conn.commit()
         conn.close()
+        
+        # Enviar notificación inmediata
+        self.send_lead_notification(phone, products_interested, conversation_summary)
+        
+        return lead_id
     
-    def add_hot_lead(self, user_id, lead_score, notes=None):
-        """Agregar lead caliente"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT OR REPLACE INTO hot_leads (user_id, lead_score, notes) VALUES (?, ?, ?)",
-            (user_id, lead_score, notes)
-        )
-        conn.commit()
-        conn.close()
-        logger.warning(f"🔥 HOT LEAD: {user_id} - Score: {lead_score} - {notes}")
+    def send_lead_notification(self, phone, products, conversation):
+        """Enviar notificación por WhatsApp al dueño"""
+        try:
+            # Extraer cantidad si está mencionada en la conversación
+            quantity_match = re.search(r'(dos|tres|cuatro|cinco|\d+)', conversation.lower())
+            quantity = ""
+            if quantity_match:
+                num_word = quantity_match.group(1)
+                if num_word == "dos": quantity = "2"
+                elif num_word == "tres": quantity = "3" 
+                elif num_word == "cuatro": quantity = "4"
+                elif num_word == "cinco": quantity = "5"
+                else: quantity = num_word
+                
+            # Crear mensaje de notificación
+            message = f"🔥 LEAD CALIENTE 🔥\n"
+            message += f"📱 Teléfono: {phone}\n"
+            message += f"🛍️ Productos: {products}\n"
+            if quantity:
+                message += f"📦 Cantidad: {quantity} unidades\n"
+            message += f"💬 Cliente {conversation[-50:]}...\n"
+            message += f"⏰ {datetime.now().strftime('%H:%M:%S')}"
+            
+            logger.warning(f"🚨 LEAD NOTIFICATION: {message}")
+            
+            # TODO: Implementar envío real por WhatsApp Business API
+            # self.send_whatsapp_to_owner(message)
+            
+        except Exception as e:
+            logger.error(f"Error sending lead notification: {e}")
 
 # Inicializar base de datos
 db = DatabaseManager()
 
-def rate_limit_check(user_id):
-    """Verificar rate limiting"""
-    now = time.time()
-    user_requests[user_id] = [req_time for req_time in user_requests[user_id] if now - req_time < 60]
-    
-    if len(user_requests[user_id]) >= RATE_LIMIT:
-        return False
-    
-    user_requests[user_id].append(now)
-    return True
-
-def get_user_profile(user_id):
-    """Obtener perfil del usuario desde Facebook"""
+# Cliente Groq
+client = None
+if GROQ_API_KEY:
     try:
-        url = f"https://graph.facebook.com/v18.0/{user_id}"
-        params = {
-            'fields': 'first_name,last_name,profile_pic',
-            'access_token': FACEBOOK_ACCESS_TOKEN
-        }
-        response = requests.get(url, params=params)
-        return response.json() if response.status_code == 200 else {}
+        client = Groq(api_key=GROQ_API_KEY)
+        logger.info("✅ Groq client initialized successfully")
     except Exception as e:
-        logger.error(f"Error getting user profile: {e}")
-        return {}
+        logger.error(f"⚠️ Error with Groq: {e}")
+        client = None
 
-def analyze_purchase_intent(message, conversation_history):
-    """Analizar intención de compra"""
-    intent_keywords = {
-        'high': ['comprar', 'precio', 'cuanto', 'disponible', 'stock', 'whatsapp', 'contacto', 'ubicacion'],
-        'medium': ['interesa', 'info', 'detalles', 'envio', 'delivery'],
-        'low': ['hola', 'buenos dias', 'que tal']
-    }
+def extract_phone_number(message):
+    """Extraer número de teléfono del mensaje"""
+    # Buscar patrones de teléfono boliviano
+    patterns = [
+        r'\b[67]\d{7}\b',  # 8 dígitos empezando con 6 o 7
+        r'\b[67]\d{3}[-\s]?\d{4}\b',  # Con guion o espacio
+        r'\+591[-\s]?[67]\d{7}\b'  # Con código de país
+    ]
     
-    message_lower = message.lower()
-    score = 0
+    for pattern in patterns:
+        match = re.search(pattern, message)
+        if match:
+            return match.group().replace('-', '').replace(' ', '').replace('+591', '')
     
-    # Analizar mensaje actual
-    for word in intent_keywords['high']:
-        if word in message_lower:
-            score += 3
+    return None
+
+def get_objective_response(user_message, user_id):
+    """Respuestas objetivas y directas orientadas a venta"""
+    message_lower = user_message.lower()
     
-    for word in intent_keywords['medium']:
-        if word in message_lower:
-            score += 2
+    # Extraer teléfono si lo proporciona
+    phone = extract_phone_number(user_message)
+    if phone:
+        # Obtener productos mencionados en la conversación
+        conversation = db.get_conversation_history(user_id, 10)
+        products_mentioned = []
+        total_conversation = " ".join([msg["content"] for msg in conversation])
+        
+        # Buscar productos mencionados
+        all_products = db.get_all_products()
+        for product in all_products:
+            if product['name'].lower() in total_conversation.lower():
+                products_mentioned.append(product['name'])
+        
+        # Guardar como lead caliente
+        products_str = ", ".join(products_mentioned) if products_mentioned else "Productos varios"
+        db.save_hot_lead(user_id, phone, products_str, total_conversation[-200:])
+        
+        return f"Ok, ya te escribo al WhatsApp"
     
-    for word in intent_keywords['low']:
-        if word in message_lower:
-            score += 1
+    # Buscar productos mencionados
+    products = db.search_products(user_message)
     
-    # Analizar historial
-    if len(conversation_history) > 3:
-        score += 2  # Usuario comprometido
+    # Respuestas súper directas exactamente como especificaste
+    if any(word in message_lower for word in ['hola', 'buenos', 'buenas', 'hey']):
+        return "Hola! ¿Qué producto necesitas?"
     
-    return min(score, 10)  # Máximo 10
+    elif any(word in message_lower for word in ['taper', 'tupper', 'contenedor', 'recipiente']):
+        return "Sí"
+    
+    elif any(word in message_lower for word in ['vaso', 'copa']):
+        return "Sí"
+    
+    elif any(word in message_lower for word in ['plato']):
+        return "Sí"
+    
+    elif any(word in message_lower for word in ['precio', 'cuanto', 'cuesta', 'valor']):
+        # Verificar qué producto mencionaron en la conversación
+        conversation = db.get_conversation_history(user_id, 5)
+        full_conversation = " ".join([msg["content"] for msg in conversation])
+        
+        if any(word in full_conversation.lower() for word in ['taper', 'tupper']):
+            return "35 bs"
+        elif any(word in full_conversation.lower() for word in ['vaso', 'copa']):
+            return "12 bs"
+        elif any(word in full_conversation.lower() for word in ['plato']):
+            return "20 bs"
+        else:
+            return "¿De qué producto?"
+    
+    elif any(word in message_lower for word in ['menos', 'descuento', 'rebaja', 'barato', 'nada menos']):
+        return f"Nada menos 😅, pero incluye delivery hasta {BUSINESS_CONFIG['delivery_zone']}"
+    
+    elif any(word in message_lower for word in ['dos', 'tres', 'cuatro', 'cinco', 'cantidad']) or any(char.isdigit() for char in user_message):
+        # Extraer cantidad
+        numbers = re.findall(r'\d+', user_message)
+        if numbers:
+            quantity = numbers[0]
+            return f"Ok. Deme su teléfono"
+        else:
+            return "¿Cuántos necesitas?"
+    
+    elif any(word in message_lower for word in ['delivery', 'envio', 'donde', 'ubicacion']):
+        return f"Delivery gratis hasta {BUSINESS_CONFIG['delivery_zone']}"
+    
+    elif any(word in message_lower for word in ['telefono', 'contacto', 'whatsapp', 'numero']):
+        return "Deme su número"
+    
+    elif any(word in message_lower for word in ['quiero', 'compro', 'llevo', 'acepto', 'esta bien', 'ok', 'me da']):
+        return "Ok. Deme su teléfono"
+    
+    elif any(word in message_lower for word in ['que', 'tienes', 'vendes', 'productos', 'catalogo']):
+        return "Tappers, vasos, platos. ¿Qué necesita?"
+    
+    elif any(word in message_lower for word in ['stock', 'disponible', 'hay']):
+        return "Sí hay"
+    
+    else:
+        return "¿En qué le puedo ayudar?"
 
 def get_enhanced_ai_response(user_message, user_id):
-    """Generar respuesta mejorada con IA"""
+    """Respuesta con IA súper objetiva"""
     if client is None:
-        return "Disculpa, el servicio no está disponible. Contacta por WhatsApp al " + BUSINESS_CONFIG['whatsapp']
+        return get_objective_response(user_message, user_id)
     
     try:
-        # Obtener historial de conversación
-        conversation_history = db.get_conversation_history(user_id, 8)
+        conversation_history = db.get_conversation_history(user_id, 4)
         
-        # Analizar intención de compra
-        intent_score = analyze_purchase_intent(user_message, conversation_history)
-        
-        # Sistema de prompt mejorado
-        system_prompt = f"""Eres un vendedor experto de {BUSINESS_CONFIG['name']}, especializado en {BUSINESS_CONFIG['product']}.
+        # Sistema prompt súper directo
+        system_prompt = f"""Eres un vendedor SÚPER DIRECTO de {BUSINESS_CONFIG['name']}. 
 
-INFORMACIÓN DEL NEGOCIO:
-- Producto: {BUSINESS_CONFIG['product']} de excelente calidad
-- Precio: {BUSINESS_CONFIG['price']} bs por unidad
-- Envío GRATIS dentro del {BUSINESS_CONFIG['delivery_zone']}
-- Envío fuera de zona: +{BUSINESS_CONFIG['delivery_cost']} bs
-- WhatsApp: {BUSINESS_CONFIG['whatsapp']}
+PRODUCTOS:
+- Tappers: 35 bs
+- Vasos: 12 bs  
+- Platos: 20 bs
 
-PAUTAS DE CONVERSACIÓN:
-1. Sé natural, amigable y profesional
-2. Responde máximo 2 líneas
-3. Si preguntan por stock: "Sí tengo disponible"
-4. Si preguntan ubicación para envío: da el WhatsApp
-5. Si muestran interés fuerte: facilita el WhatsApp
-6. Enfócate en beneficios del producto
-7. Crea urgencia sutil si es apropiado
+REGLAS ESTRICTAS PARA RESPUESTAS:
+1. Máximo 8 palabras por respuesta
+2. SÉ SÚPER DIRECTO
 
-EJEMPLOS DE RESPUESTAS:
-- "Los {BUSINESS_CONFIG['product']} están a {BUSINESS_CONFIG['price']} bs, excelente calidad 👌"
-- "Perfecto! Escríbeme al {BUSINESS_CONFIG['whatsapp']} para coordinar el envío"
-- "Sí tengo stock disponible. Envío gratis en {BUSINESS_CONFIG['delivery_zone']}"
+RESPUESTAS EXACTAS:
+- Si preguntan "tiene X?": responde solo "Sí"
+- Si preguntan precio después de mencionar producto: solo el precio "35 bs"
+- Si piden descuento: "Nada menos 😅, pero incluye delivery hasta {BUSINESS_CONFIG['delivery_zone']}"
+- Si aceptan/quieren comprar: "Ok. Deme su teléfono"
+- Si dan teléfono: "Ok, ya te escribo al WhatsApp"
 
-IMPORTANTE: Solo eres el vendedor, nunca menciones que eres IA."""
+EJEMPLOS EXACTOS:
+Usuario: "tiene tappers?"
+Tú: "Sí"
 
-        # Preparar mensajes
+Usuario: "que precio tiene?"
+Tú: "35 bs"
+
+Usuario: "nada menos?"
+Tú: "Nada menos 😅, pero incluye delivery hasta {BUSINESS_CONFIG['delivery_zone']}"
+
+Usuario: "esta bien me da dos"
+Tú: "Ok. Deme su teléfono"
+
+Usuario: "74604643"
+Tú: "Ok, ya te escribo al WhatsApp"
+
+NUNCA agregues palabras extra. SÉ EXACTO."""
+
         messages = [{"role": "system", "content": system_prompt}]
-        messages.extend(conversation_history[-6:])  # Últimos 6 mensajes
+        messages.extend(conversation_history[-3:])
         messages.append({"role": "user", "content": user_message})
         
-        # Llamada a Groq
         chat_completion = client.chat.completions.create(
             messages=messages,
             model="llama3-8b-8192",
-            temperature=0.6,
-            max_tokens=100
+            temperature=0.1,  # Muy bajo para respuestas consistentes
+            max_tokens=50    # Máximo 50 tokens para respuestas cortas
         )
         
         ai_response = chat_completion.choices[0].message.content.strip()
+        
+        # Verificar si dieron teléfono
+        phone = extract_phone_number(user_message)
+        if phone:
+            conversation = db.get_conversation_history(user_id, 10)
+            total_conversation = " ".join([msg["content"] for msg in conversation])
+            db.save_hot_lead(user_id, phone, "Productos mencionados en chat", total_conversation[-200:])
         
         # Guardar en base de datos
         db.add_message(user_id, user_message, "user")
         db.add_message(user_id, ai_response, "assistant")
         
-        # Actualizar usuario
-        db.update_user(
-            user_id, 
-            last_interaction=datetime.now(),
-            total_messages=1,  # Se incrementará automáticamente
-            purchase_intent=(intent_score >= 5)
-        )
-        
-        # Si es un lead caliente, registrarlo
-        if intent_score >= 6:
-            notes = f"Mensaje: {user_message[:50]}..."
-            db.add_hot_lead(user_id, intent_score, notes)
-        
-        # Analytics
-        db.log_analytics("message_received", user_id, {
-            "message": user_message,
-            "intent_score": intent_score,
-            "response": ai_response
-        })
-        
         return ai_response
         
     except Exception as e:
         logger.error(f"Error with Groq AI: {e}")
-        return "Disculpa, tengo un problema técnico. ¿Podrías escribirme al " + BUSINESS_CONFIG['whatsapp'] + "?"
+        return get_objective_response(user_message, user_id)
 
 def send_facebook_message(recipient_id, message_text):
     """Enviar mensaje a Facebook Messenger"""
@@ -358,31 +478,14 @@ def send_facebook_message(recipient_id, message_text):
     
     try:
         response = requests.post(url, headers=headers, json=data)
-        if response.status_code != 200:
-            logger.error(f"Error sending message: {response.text}")
         return response.json()
     except Exception as e:
         logger.error(f"Error sending Facebook message: {e}")
         return {}
 
-def send_typing_indicator(recipient_id):
-    """Enviar indicador de escritura"""
-    url = f"https://graph.facebook.com/v18.0/me/messages"
-    
-    data = {
-        "recipient": {"id": recipient_id},
-        "sender_action": "typing_on",
-        "access_token": FACEBOOK_ACCESS_TOKEN
-    }
-    
-    try:
-        requests.post(url, json=data)
-    except Exception as e:
-        logger.error(f"Error sending typing indicator: {e}")
-
+# WEBHOOK ENDPOINTS
 @app.route('/webhook', methods=['GET'])
 def verify_webhook():
-    """Verificación del webhook de Facebook"""
     token = request.args.get('hub.verify_token')
     challenge = request.args.get('hub.challenge')
     
@@ -395,7 +498,6 @@ def verify_webhook():
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """Recibir mensajes de Facebook Messenger"""
     data = request.get_json()
     
     try:
@@ -403,56 +505,19 @@ def webhook():
             for messaging_event in entry.get('messaging', []):
                 if 'message' in messaging_event:
                     sender_id = messaging_event['sender']['id']
-                    
-                    # Verificar rate limiting
-                    if not rate_limit_check(sender_id):
-                        logger.warning(f"Rate limit exceeded for user {sender_id}")
-                        continue
-                    
-                    # Manejar diferentes tipos de mensaje
                     message = messaging_event['message']
                     
                     if 'text' in message:
                         message_text = message['text']
                         logger.info(f"Message from {sender_id}: {message_text}")
                         
-                        # Obtener perfil del usuario (primera vez)
-                        user_profile = get_user_profile(sender_id)
-                        if user_profile:
-                            db.update_user(
-                                sender_id,
-                                first_name=user_profile.get('first_name', ''),
-                                last_name=user_profile.get('last_name', ''),
-                                profile_pic=user_profile.get('profile_pic', '')
-                            )
-                        
-                        # Enviar indicador de escritura
-                        send_typing_indicator(sender_id)
-                        
-                        # Generar respuesta
+                        # Generar respuesta súper directa
                         ai_response = get_enhanced_ai_response(message_text, sender_id)
                         
                         # Enviar respuesta
                         send_facebook_message(sender_id, ai_response)
                         
                         logger.info(f"Response sent to {sender_id}: {ai_response}")
-                        
-                        # Notificación especial para leads calientes
-                        if any(keyword in ai_response.lower() for keyword in ['whatsapp', BUSINESS_CONFIG['whatsapp']]):
-                            logger.warning(f"🚨 CLIENTE LISTO PARA COMPRAR: {sender_id}")
-                            db.log_analytics("whatsapp_provided", sender_id, {"response": ai_response})
-                    
-                    elif 'attachments' in message:
-                        # Manejar imágenes, stickers, etc.
-                        attachment_type = message['attachments'][0]['type']
-                        if attachment_type == 'image':
-                            response = f"Vi tu imagen! Para más info sobre {BUSINESS_CONFIG['product']}, están a {BUSINESS_CONFIG['price']} bs. ¿Te interesa?"
-                        else:
-                            response = f"Hola! Te ofrezco {BUSINESS_CONFIG['product']} a {BUSINESS_CONFIG['price']} bs. ¿Te interesa?"
-                        
-                        send_facebook_message(sender_id, response)
-                        db.add_message(sender_id, f"[{attachment_type}]", "user")
-                        db.add_message(sender_id, response, "assistant")
         
         return jsonify({"status": "success"}), 200
         
@@ -460,112 +525,222 @@ def webhook():
         logger.error(f"Error processing webhook: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
-@app.route('/analytics', methods=['GET'])
-def analytics():
-    """Dashboard de analytics"""
-    conn = sqlite3.connect(db.db_path)
-    cursor = conn.cursor()
+# PANEL ADMIN SIMPLE
+ADMIN_TEMPLATE = '''
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Panel Admin - {{ business_name }}</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+        .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; }
+        .header { text-align: center; color: #333; margin-bottom: 30px; }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; font-weight: bold; }
+        input, textarea { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 5px; }
+        .btn { background: #007bff; color: white; padding: 12px 24px; border: none; border-radius: 5px; cursor: pointer; }
+        .btn:hover { background: #0056b3; }
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+        th, td { padding: 10px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background: #f8f9fa; }
+        .success { color: green; font-weight: bold; }
+        .error { color: red; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>⚙️ Panel de Administración</h1>
+            <p>{{ business_name }} - Gestión Directa</p>
+        </div>
+        
+        {% if message %}
+        <div style="padding: 15px; margin-bottom: 20px; border-radius: 5px; {{ 'background: #d4edda; color: #155724;' if success else 'background: #f8d7da; color: #721c24;' }}">
+            {{ message }}
+        </div>
+        {% endif %}
+        
+        <h2>➕ Agregar Producto</h2>
+        <form method="POST" action="/admin/add">
+            <div class="form-group">
+                <label>Nombre:</label>
+                <input type="text" name="name" required placeholder="Ej: Tappers grandes">
+            </div>
+            <div class="form-group">
+                <label>Precio (Bs):</label>
+                <input type="number" name="price" step="0.01" required placeholder="35">
+            </div>
+            <div class="form-group">
+                <label>Stock:</label>
+                <input type="number" name="stock" required placeholder="100">
+            </div>
+            <div class="form-group">
+                <label>Palabras clave (separadas por comas):</label>
+                <input type="text" name="keywords" placeholder="taper,tupper,contenedor">
+            </div>
+            <button type="submit" class="btn">Agregar Producto</button>
+        </form>
+        
+        <h2>📦 Productos Actuales</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Nombre</th>
+                    <th>Precio</th>
+                    <th>Stock</th>
+                    <th>Keywords</th>
+                    <th>Estado</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for product in products %}
+                <tr>
+                    <td>{{ product.name }}</td>
+                    <td>{{ product.price }} bs</td>
+                    <td>{{ product.stock }}</td>
+                    <td>{{ product.keywords }}</td>
+                    <td>{{ 'Activo' if product.active else 'Inactivo' }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        
+        <h2>🔥 Leads Calientes</h2>
+        <div id="leads">
+            <p>Cargando leads...</p>
+        </div>
+    </div>
     
-    # Estadísticas generales
-    cursor.execute("SELECT COUNT(*) FROM users")
-    total_users = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT COUNT(*) FROM conversations")
-    total_messages = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT COUNT(*) FROM hot_leads WHERE contacted = FALSE")
-    pending_leads = cursor.fetchone()[0]
-    
-    # Usuarios activos hoy
-    cursor.execute(
-        "SELECT COUNT(*) FROM users WHERE DATE(last_interaction) = DATE('now')"
-    )
-    active_today = cursor.fetchone()[0]
-    
-    # Leads calientes recientes
-    cursor.execute(
-        "SELECT user_id, lead_score, notes, last_activity FROM hot_leads ORDER BY last_activity DESC LIMIT 10"
-    )
-    recent_leads = cursor.fetchall()
-    
-    conn.close()
-    
-    return jsonify({
-        "stats": {
-            "total_users": total_users,
-            "total_messages": total_messages,
-            "pending_leads": pending_leads,
-            "active_today": active_today
-        },
-        "recent_leads": [
-            {
-                "user_id": lead[0],
-                "score": lead[1],
-                "notes": lead[2],
-                "timestamp": lead[3]
-            } for lead in recent_leads
-        ]
-    })
+    <script>
+        async function loadLeads() {
+            try {
+                const response = await fetch('/admin/leads');
+                const data = await response.json();
+                
+                const leadsDiv = document.getElementById('leads');
+                
+                if (data.leads.length === 0) {
+                    leadsDiv.innerHTML = '<p>No hay leads pendientes</p>';
+                    return;
+                }
+                
+                leadsDiv.innerHTML = data.leads.map(lead => `
+                    <div style="background: #fff3cd; padding: 15px; margin: 10px 0; border-radius: 5px; border-left: 4px solid #ffc107;">
+                        <strong>📱 ${lead.phone}</strong><br>
+                        🛍️ Productos: ${lead.products}<br>
+                        📝 ${lead.conversation.substring(0, 100)}...<br>
+                        ⏰ ${new Date(lead.created_at).toLocaleString('es-ES')}
+                    </div>
+                `).join('');
+                
+            } catch (error) {
+                console.error('Error loading leads:', error);
+            }
+        }
+        
+        loadLeads();
+        setInterval(loadLeads, 10000); // Actualizar cada 10 segundos
+    </script>
+</body>
+</html>
+'''
 
-@app.route('/hot-leads', methods=['GET'])
-def get_hot_leads():
-    """Obtener leads calientes"""
+@app.route('/admin')
+def admin_panel():
+    products = db.get_all_products(active_only=False)
+    return render_template_string(ADMIN_TEMPLATE, 
+                                products=products, 
+                                business_name=BUSINESS_CONFIG['name'])
+
+@app.route('/admin/add', methods=['POST'])
+def add_product():
+    try:
+        name = request.form['name']
+        price = float(request.form['price'])
+        stock = int(request.form['stock'])
+        keywords = request.form.get('keywords', '')
+        
+        conn = sqlite3.connect(db.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO products (name, price, stock, keywords) VALUES (?, ?, ?, ?)",
+            (name, price, stock, keywords)
+        )
+        conn.commit()
+        conn.close()
+        
+        products = db.get_all_products(active_only=False)
+        return render_template_string(ADMIN_TEMPLATE, 
+                                    products=products, 
+                                    business_name=BUSINESS_CONFIG['name'],
+                                    message=f"✅ Producto '{name}' agregado",
+                                    success=True)
+        
+    except Exception as e:
+        products = db.get_all_products(active_only=False)
+        return render_template_string(ADMIN_TEMPLATE, 
+                                    products=products, 
+                                    business_name=BUSINESS_CONFIG['name'],
+                                    message=f"❌ Error: {str(e)}",
+                                    success=False)
+
+@app.route('/admin/leads')
+def get_leads():
+    """API para obtener leads calientes"""
     conn = sqlite3.connect(db.db_path)
     cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT h.user_id, h.lead_score, h.notes, h.last_activity, h.contacted,
-               u.first_name, u.last_name
-        FROM hot_leads h
-        LEFT JOIN users u ON h.user_id = u.user_id
-        ORDER BY h.last_activity DESC
-    """)
-    
+    cursor.execute(
+        "SELECT phone, products_interested, conversation_summary, created_at FROM hot_leads WHERE contacted = FALSE ORDER BY created_at DESC"
+    )
     leads = cursor.fetchall()
     conn.close()
     
     return jsonify({
         "leads": [
             {
-                "user_id": lead[0],
-                "score": lead[1],
-                "notes": lead[2],
-                "last_activity": lead[3],
-                "contacted": lead[4],
-                "name": f"{lead[5] or ''} {lead[6] or ''}".strip() or "Usuario"
+                "phone": lead[0],
+                "products": lead[1],
+                "conversation": lead[2],
+                "created_at": lead[3]
             } for lead in leads
         ]
     })
 
 @app.route('/test', methods=['GET'])
 def test():
-    """Endpoint de prueba mejorado"""
     return jsonify({
-        "status": "Bot funcionando correctamente ✅",
+        "status": "Bot Objetivo funcionando ✅",
         "business": BUSINESS_CONFIG['name'],
-        "product": BUSINESS_CONFIG['product'],
-        "groq_status": "connected" if client else "disconnected",
-        "database_status": "connected",
-        "version": "2.0 - Enhanced"
+        "version": "4.0 - Súper Directo",
+        "products_count": len(db.get_all_products()),
+        "groq_status": "connected" if client else "fallback mode",
+        "features": [
+            "✅ Respuestas súper directas",
+            "✅ Detección automática de teléfonos", 
+            "✅ Notificaciones de leads calientes",
+            "✅ Panel admin simple",
+            "✅ Orientado 100% a ventas"
+        ]
     })
 
 @app.route('/', methods=['GET'])
 def home():
-    """Página de inicio"""
     return jsonify({
-        "message": f"🤖 {BUSINESS_CONFIG['name']} - Bot Marketplace v2.0",
+        "message": f"🎯 {BUSINESS_CONFIG['name']} - Bot Súper Directo v4.0",
         "status": "online",
-        "features": [
-            "✅ Base de datos persistente",
-            "✅ Analytics avanzados", 
-            "✅ Detección de leads calientes",
-            "✅ Rate limiting",
-            "✅ Manejo de attachments",
-            "✅ Logging completo"
-        ]
+        "conversacion_ejemplo": {
+            "cliente": "tiene taper?",
+            "bot": "Sí",
+            "cliente": "precio?", 
+            "bot": "35 bs",
+            "cliente": "quiero dos",
+            "bot": "Ok. Dame tu teléfono"
+        }
     })
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
-    logger.info(f"Starting bot server on port {port}")
+    logger.info(f"Starting objective sales bot on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
