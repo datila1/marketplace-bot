@@ -279,15 +279,17 @@ class DatabaseManager:
 # Inicializar base de datos
 db = DatabaseManager()
 
-# Cliente Groq
+# Cliente Groq - REACTIVADO con versión compatible
 client = None
 if GROQ_API_KEY:
     try:
         client = Groq(api_key=GROQ_API_KEY)
         logger.info("✅ Groq client initialized successfully")
     except Exception as e:
-        logger.error(f"⚠️ Error with Groq: {e}")
+        logger.error(f"⚠️ Error with Groq (using fallback): {e}")
         client = None
+else:
+    logger.warning("⚠️ GROQ_API_KEY not found - using fallback responses")
 
 def extract_phone_number(message):
     """Extraer número de teléfono del mensaje"""
@@ -348,7 +350,7 @@ def get_objective_response(user_message, user_id):
     elif any(word in message_lower for word in ['plato']):
         return "Sí"
     
-    elif any(word in message_lower for word in ['precio', 'cuanto', 'cuesta', 'valor', 'a cuanto']):
+    elif any(word in message_lower for word in ['precio', 'cuanto', 'cuesta', 'valor', 'a cuanto', 'estan']):
         # Verificar qué producto mencionaron en la conversación reciente
         conversation = db.get_conversation_history(user_id, 8)
         full_conversation = " ".join([msg["content"] for msg in conversation]).lower()
@@ -409,42 +411,48 @@ def get_enhanced_ai_response(user_message, user_id):
     try:
         conversation_history = db.get_conversation_history(user_id, 4)
         
-        # Sistema prompt súper directo
+        # Sistema prompt súper directo y mejorado
         system_prompt = f"""Eres un vendedor SÚPER DIRECTO de {BUSINESS_CONFIG['name']}. 
 
-PRODUCTOS:
-- Tappers: 35 bs
-- Vasos: 12 bs  
-- Platos: 20 bs
+PRODUCTOS DISPONIBLES:
+- Tappers: 35 bs (palabras clave: taper, tupper, contenedor, recipiente, guardar comida)
+- Vasos: 12 bs (palabras clave: vaso, copa, beber)
+- Platos: 20 bs (palabras clave: plato, vajilla, servir comida)
 
-REGLAS ESTRICTAS PARA RESPUESTAS:
+REGLAS ESTRICTAS:
 1. Máximo 8 palabras por respuesta
-2. SÉ SÚPER DIRECTO
+2. SÉ SÚPER DIRECTO Y OBJETIVO
+3. Si mencionan cualquier sinónimo de un producto, trátalo como ese producto
 
-RESPUESTAS EXACTAS:
+DETECCIÓN INTELIGENTE:
+- "contenedores", "recipientes", "tuppers", "guardar comida" = Tappers
+- "vasos", "copas", "beber" = Vasos  
+- "platos", "vajilla", "servir" = Platos
+
+RESPUESTAS EXACTAS OBLIGATORIAS:
 - Si preguntan "tiene X?": responde solo "Sí"
-- Si preguntan precio después de mencionar producto: solo el precio "35 bs"
+- Si preguntan precio de producto mencionado: solo el precio "35 bs"
 - Si piden descuento: "Nada menos 😅, pero incluye delivery hasta {BUSINESS_CONFIG['delivery_zone']}"
-- Si aceptan/quieren comprar: "Ok. Deme su teléfono"
+- Si aceptan/quieren comprar: "Ok. Deme su teléfono"  
 - Si dan teléfono: "Ok, ya te escribo al WhatsApp"
 
 EJEMPLOS EXACTOS:
-Usuario: "tiene tappers?"
+Usuario: "tienen contenedores para guardar comida?"
 Tú: "Sí"
 
-Usuario: "que precio tiene?"
+Usuario: "cuánto cuestan los recipientes?"
 Tú: "35 bs"
 
-Usuario: "nada menos?"
-Tú: "Nada menos 😅, pero incluye delivery hasta {BUSINESS_CONFIG['delivery_zone']}"
+Usuario: "a cuánto están?"
+Tú: "35 bs" (si mencionaron tappers antes)
 
-Usuario: "esta bien me da dos"
+Usuario: "quiero dos"
 Tú: "Ok. Deme su teléfono"
 
-Usuario: "74604643"
-Tú: "Ok, ya te escribo al WhatsApp"
-
-NUNCA agregues palabras extra. SÉ EXACTO."""
+IMPORTANTE: 
+- SIEMPRE usa las respuestas exactas de los ejemplos
+- NO agregues palabras extra como "excelente", "perfecto"
+- SÉ EXACTO Y DIRECTO"""
 
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend(conversation_history[-3:])
@@ -459,12 +467,26 @@ NUNCA agregues palabras extra. SÉ EXACTO."""
         
         ai_response = chat_completion.choices[0].message.content.strip()
         
-        # Verificar si dieron teléfono
+        # Verificar si dieron teléfono en el mensaje original
         phone = extract_phone_number(user_message)
         if phone:
             conversation = db.get_conversation_history(user_id, 10)
             total_conversation = " ".join([msg["content"] for msg in conversation])
-            db.save_hot_lead(user_id, phone, "Productos mencionados en chat", total_conversation[-200:])
+            
+            # Analizar productos mencionados
+            products_mentioned = []
+            if any(word in total_conversation.lower() for word in ['taper', 'tupper', 'contenedor', 'recipiente']):
+                products_mentioned.append("Tappers")
+            if any(word in total_conversation.lower() for word in ['vaso', 'copa']):
+                products_mentioned.append("Vasos")
+            if any(word in total_conversation.lower() for word in ['plato']):
+                products_mentioned.append("Platos")
+            
+            products_str = ", ".join(products_mentioned) if products_mentioned else "Productos mencionados en chat"
+            db.save_hot_lead(user_id, phone, products_str, total_conversation[-200:])
+            
+            # Forzar respuesta específica para teléfonos
+            ai_response = "Ok, ya te escribo al WhatsApp"
         
         # Guardar en base de datos
         db.add_message(user_id, user_message, "user")
