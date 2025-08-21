@@ -47,10 +47,13 @@ BUSINESS_CONFIG = {
 user_requests = defaultdict(list)
 RATE_LIMIT = 10  # máximo 10 mensajes por minuto por usuario
 
-# Cliente Groq
+# Cliente Groq con manejo de errores
 try:
-    client = Groq(api_key=GROQ_API_KEY)
-    logger.info("Groq client initialized successfully")
+    client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+    if client:
+        logger.info("Groq client initialized successfully")
+    else:
+        logger.warning("Groq API key not found")
 except Exception as e:
     logger.error(f"Error initializing Groq: {e}")
     client = None
