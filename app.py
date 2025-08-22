@@ -557,7 +557,7 @@ def get_bot_response(user_id, message):
                 if is_quantity_inquiry(message):
                     return f"{quantity} tapper en {calc['total']}bs con descuento de {calc['discount_amount']}bs", None
                 else:
-                    return f"ok si quiere {quantity} te hago un descuento de {calc['discount_amount']}bs, {quantity} tapper en {calc['total']}bs", None
+                    return f"ok si quiere {quantity} te hago un descuento de {calc['discount_amount']}bs, {quantity} tapper en {calc['total']}bs. Deme su teléfono", None
             else:
                 # Sin descuento (2 unidades) - mencionar descuento disponible
                 if is_quantity_inquiry(message):
