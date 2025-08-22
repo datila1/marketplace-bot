@@ -522,7 +522,7 @@ def get_bot_response(user_id, message):
             if not detect_quantity(message):
                 return "va querer 1 o 3?", None
         elif 'envio' in last_bot_response or 'delivery' in last_bot_response:
-            return "esta bien, mandeme su telefono"
+            return "esta bien, mandeme su telefono", None
         elif not detect_quantity(message):
             return "¿Cuántos quiere?", None
     
