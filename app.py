@@ -1263,5 +1263,5 @@ if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
     debug = os.getenv('DEBUG', 'True').lower() == 'true'
     
-    logging.info(f"Iniciando bot en puerto {port}")
+    logging.info(f"🚀 Iniciando bot en puerto {port} - v1.1")
     app.run(host='0.0.0.0', port=port, debug=debug)
