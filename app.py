@@ -86,7 +86,33 @@ def init_db():
         
         logging.info("Productos iniciales agregados a la base de datos")
     
-    conn.commit()
+    # Verificar y agregar columnas de promoción si no existen
+    try:
+        cursor.execute("PRAGMA table_info(products)")
+        columns = [column[1] for column in cursor.fetchall()]
+        
+        # Agregar columnas de promoción si no existen
+        new_columns = [
+            ("discount_enabled", "BOOLEAN DEFAULT FALSE"),
+            ("discount_name", "TEXT"),
+            ("discount_min_quantity", "INTEGER DEFAULT 3"),
+            ("discount_percentage", "REAL DEFAULT 10"),
+            ("discount_description", "TEXT"),
+            ("bulk_discounts", "TEXT DEFAULT '{}'")
+        ]
+        
+        for column_name, column_def in new_columns:
+            if column_name not in columns:
+                cursor.execute(f"ALTER TABLE products ADD COLUMN {column_name} {column_def}")
+                logging.info(f"Columna agregada automáticamente: {column_name}")
+        
+        conn.commit()
+        logging.info("Migración de base de datos completada")
+        
+    except Exception as e:
+        logging.error(f"Error en migración de base de datos: {e}")
+        conn.rollback()
+    
     conn.close()
     logging.info("Base de datos inicializada correctamente")
 
@@ -317,31 +343,68 @@ def get_active_products():
     conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
     
-    cursor.execute('''
-        SELECT key_name, name, price, stock, keywords, description,
-               discount_enabled, discount_name, discount_min_quantity, 
-               discount_percentage, discount_description, bulk_discounts
-        FROM products 
-        WHERE active = TRUE AND stock > 0
-        ORDER BY name
-    ''')
+    # Verificar qué columnas existen para compatibilidad con BD antigua
+    try:
+        cursor.execute("PRAGMA table_info(products)")
+        columns = [column[1] for column in cursor.fetchall()]
+        has_promotion_columns = 'discount_enabled' in columns
+        
+        if has_promotion_columns:
+            # Nueva consulta con promociones
+            cursor.execute('''
+                SELECT key_name, name, price, stock, keywords, description,
+                       discount_enabled, discount_name, discount_min_quantity, 
+                       discount_percentage, discount_description, bulk_discounts
+                FROM products 
+                WHERE active = TRUE AND stock > 0
+                ORDER BY name
+            ''')
+            
+            products = {}
+            for row in cursor.fetchall():
+                key_name, name, price, stock, keywords, description, discount_enabled, discount_name, discount_min_qty, discount_pct, discount_desc, bulk_discounts = row
+                products[key_name] = {
+                    'name': name,
+                    'price': price,
+                    'stock': stock,
+                    'keywords': keywords.split(','),
+                    'description': description,
+                    'discount_enabled': bool(discount_enabled),
+                    'discount_name': discount_name or '',
+                    'discount_min_quantity': discount_min_qty or 3,
+                    'discount_percentage': discount_pct or 0,
+                    'discount_description': discount_desc or '',
+                    'bulk_discounts': bulk_discounts or '{}'
+                }
+        else:
+            # Consulta antigua sin promociones (para compatibilidad)
+            cursor.execute('''
+                SELECT key_name, name, price, stock, keywords, description 
+                FROM products 
+                WHERE active = TRUE AND stock > 0
+                ORDER BY name
+            ''')
+            
+            products = {}
+            for row in cursor.fetchall():
+                key_name, name, price, stock, keywords, description = row
+                products[key_name] = {
+                    'name': name,
+                    'price': price,
+                    'stock': stock,
+                    'keywords': keywords.split(','),
+                    'description': description,
+                    'discount_enabled': False,  # Sin promociones por defecto
+                    'discount_name': '',
+                    'discount_min_quantity': 3,
+                    'discount_percentage': 0,
+                    'discount_description': '',
+                    'bulk_discounts': '{}'
+                }
     
-    products = {}
-    for row in cursor.fetchall():
-        key_name, name, price, stock, keywords, description, discount_enabled, discount_name, discount_min_qty, discount_pct, discount_desc, bulk_discounts = row
-        products[key_name] = {
-            'name': name,
-            'price': price,
-            'stock': stock,
-            'keywords': keywords.split(','),
-            'description': description,
-            'discount_enabled': bool(discount_enabled),
-            'discount_name': discount_name or '',
-            'discount_min_quantity': discount_min_qty or 3,
-            'discount_percentage': discount_pct or 0,
-            'discount_description': discount_desc or '',
-            'bulk_discounts': bulk_discounts or '{}'
-        }
+    except Exception as e:
+        logging.error(f"Error obteniendo productos: {e}")
+        products = {}
     
     conn.close()
     return products
