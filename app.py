@@ -471,6 +471,34 @@ def is_quantity_inquiry(message):
     
     return any(keyword in message_lower for keyword in inquiry_keywords)
 
+def send_facebook_typing_indicator(recipient_id, action="typing_on"):
+    """Enviar indicador de escritura a Facebook Messenger"""
+    page_access_token = os.getenv('PAGE_ACCESS_TOKEN')
+    
+    if not page_access_token or page_access_token == 'PEGA_AQUI_TU_PAGE_ACCESS_TOKEN':
+        return False
+    
+    url = f"https://graph.facebook.com/v18.0/me/messages?access_token={page_access_token}"
+    
+    payload = {
+        'recipient': {'id': recipient_id},
+        'sender_action': action  # "typing_on", "typing_off", o "mark_seen"
+    }
+    
+    headers = {'Content-Type': 'application/json'}
+    
+    try:
+        response = requests.post(url, data=json.dumps(payload), headers=headers)
+        if response.status_code == 200:
+            logging.info(f"Indicador de escritura enviado: {action}")
+            return True
+        else:
+            logging.error(f"Error enviando indicador: {response.status_code}")
+            return False
+    except Exception as e:
+        logging.error(f"Error enviando indicador de escritura: {e}")
+        return False
+
 def send_facebook_message(recipient_id, message_text):
     """Enviar mensaje de respuesta a Facebook Messenger"""
     page_access_token = os.getenv('PAGE_ACCESS_TOKEN')
@@ -500,6 +528,41 @@ def send_facebook_message(recipient_id, message_text):
             
     except Exception as e:
         logging.error(f"Excepción enviando mensaje a Facebook: {e}")
+        return False
+
+def send_whatsapp_typing_indicator(recipient_phone, action="recording"):
+    """Enviar indicador de escritura a WhatsApp via UltraMsg"""
+    try:
+        ultramsg_token = os.getenv('ULTRAMSG_TOKEN', '')
+        ultramsg_instance = os.getenv('ULTRAMSG_INSTANCE', '')
+        
+        if not ultramsg_token or not ultramsg_instance:
+            return False
+        
+        # Asegurar formato correcto del número
+        clean_phone = recipient_phone.replace('+', '').replace(' ', '').replace('-', '')
+        if not clean_phone.startswith('591'):
+            clean_phone = '591' + clean_phone
+        
+        # UltraMsg permite "typing" o "recording"
+        url = f"https://api.ultramsg.com/{ultramsg_instance}/messages/action"
+        payload = {
+            "token": ultramsg_token,
+            "to": clean_phone,
+            "action": action  # "typing" o "recording"
+        }
+        
+        response = requests.post(url, data=payload, timeout=5)
+        
+        if response.status_code == 200:
+            logging.info(f"Indicador WhatsApp enviado: {action} a {clean_phone}")
+            return True
+        else:
+            logging.warning(f"Error indicador WhatsApp: {response.status_code}")
+            return False
+            
+    except Exception as e:
+        logging.error(f"Error enviando indicador WhatsApp: {e}")
         return False
 
 def send_whatsapp_response(recipient_phone, message_text):
@@ -603,6 +666,64 @@ def get_gendered_greeting(user_id):
         return 'estimado'
     else:
         return 'estimado(a)'  # Default si no se puede determinar
+
+def calculate_realistic_typing_time(message_text):
+    """Calcular tiempo realista de escritura basado en el mensaje"""
+    # Parámetros realistas de escritura humana
+    words_per_minute = 40  # Velocidad promedio de escritura
+    chars_per_word = 5     # Caracteres promedio por palabra
+    
+    # Calcular tiempo base
+    char_count = len(message_text)
+    word_count = char_count / chars_per_word
+    base_time_seconds = (word_count / words_per_minute) * 60
+    
+    # Ajustes para hacer más realista
+    min_time = 1.5  # Mínimo 1.5 segundos para mensajes cortos
+    max_time = 8.0  # Máximo 8 segundos para mensajes largos
+    
+    # Agregar variabilidad humana (+/- 20%)
+    import random
+    variation = random.uniform(0.8, 1.2)
+    realistic_time = base_time_seconds * variation
+    
+    # Aplicar límites
+    final_time = max(min_time, min(realistic_time, max_time))
+    
+    return round(final_time, 1)
+
+def send_message_with_typing(platform, recipient_id, message_text):
+    """Enviar mensaje con indicador de escritura realista"""
+    typing_time = calculate_realistic_typing_time(message_text)
+    
+    if platform == 'facebook':
+        # Mostrar "escribiendo..."
+        send_facebook_typing_indicator(recipient_id, "typing_on")
+        
+        # Esperar tiempo realista
+        time.sleep(typing_time)
+        
+        # Enviar mensaje
+        success = send_facebook_message(recipient_id, message_text)
+        
+        # Opcional: desactivar indicador (se desactiva automáticamente al enviar mensaje)
+        send_facebook_typing_indicator(recipient_id, "typing_off")
+        
+        return success
+        
+    elif platform == 'whatsapp':
+        # Mostrar "escribiendo..."
+        send_whatsapp_typing_indicator(recipient_id, "typing")
+        
+        # Esperar tiempo realista
+        time.sleep(typing_time)
+        
+        # Enviar mensaje
+        success = send_whatsapp_response(recipient_id, message_text)
+        
+        return success
+    
+    return False
 
 def calculate_discount_and_total(quantity, unit_price, product_info=None):
     """Calcular descuento y total basado en cantidad y configuración del producto"""
@@ -892,8 +1013,8 @@ def webhook():
                                 # Guardar conversación
                                 save_conversation(sender_id, message_text, bot_response, phone)
                                 
-                                # Enviar respuesta a Facebook
-                                send_facebook_message(sender_id, bot_response)
+                                # Enviar respuesta a Facebook con indicador de escritura
+                                send_message_with_typing('facebook', sender_id, bot_response)
                                 
                                 logging.info(f"Respuesta procesada: {bot_response}")
                                 
@@ -933,8 +1054,8 @@ def whatsapp_webhook():
                 # Guardar conversación
                 save_conversation(sender_phone, message_text, bot_response, phone)
                 
-                # Enviar respuesta a WhatsApp
-                send_whatsapp_response(sender_phone, bot_response)
+                # Enviar respuesta a WhatsApp con indicador de escritura
+                send_message_with_typing('whatsapp', sender_phone, bot_response)
                 
                 logging.info(f"📱 WhatsApp respuesta enviada: {bot_response}")
                 
@@ -1017,10 +1138,16 @@ def test():
         message = data.get('message', '')
         user_id = data.get('user_id', 'test_user')
         
+        # Simular tiempo de escritura realista en el test local
         bot_response, phone = get_bot_response(user_id, message)
+        typing_time = calculate_realistic_typing_time(bot_response)
+        
+        # Agregar un pequeño delay para simular escritura
+        time.sleep(min(typing_time * 0.3, 2.0))  # Reducido para mejor UX en test
+        
         save_conversation(user_id, message, bot_response, phone)
         
-        return jsonify({'response': bot_response})
+        return jsonify({'response': bot_response, 'typing_time': typing_time})
 
 @app.route('/admin')
 def admin():
