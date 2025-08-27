@@ -134,12 +134,55 @@ def send_whatsapp_notification(lead_info):
     """Enviar notificación a WhatsApp cuando se capture un lead"""
     owner_phone = "+59178056048"  # Tu número de WhatsApp
     
-    message = f"🔔 NUEVO LEAD CAPTURADO!\n\n📱 Cliente: {lead_info['phone']}\n🛍️ Productos: {', '.join(lead_info['products'])}\n⏰ Hora: {datetime.now().strftime('%H:%M %d/%m/%Y')}\n\n💬 Contactar al cliente ahora!"
+    # Crear mensaje detallado con información del pedido
+    message = f"🔔 *NUEVO PEDIDO CAPTURADO!*\n\n"
+    message += f"📱 *Cliente:* {lead_info['phone']}\n"
+    message += f"⏰ *Hora:* {datetime.now().strftime('%H:%M %d/%m/%Y')}\n\n"
+    
+    # Información de productos
+    message += f"🛍️ *PRODUCTOS SOLICITADOS:*\n"
+    if 'order_details' in lead_info and lead_info['order_details']:
+        for product in lead_info['order_details']:
+            message += f"• {product['name']} - {product['price']}bs\n"
+    else:
+        message += f"• {', '.join(lead_info['products'])}\n"
+    
+    # Cantidad si se detectó
+    if lead_info.get('quantity'):
+        message += f"\n📊 *Cantidad:* {lead_info['quantity']} unidad(es)\n"
+        
+        # Calcular total si hay cantidad
+        if 'order_details' in lead_info and lead_info['order_details']:
+            total = 0
+            for product in lead_info['order_details']:
+                calc = calculate_discount_and_total(lead_info['quantity'], product['price'], product.get('product_info'))
+                total += calc['total']
+            message += f"💰 *Total estimado:* {total}bs"
+            if calc.get('has_discount'):
+                message += f" (con descuento)"
+            message += f"\n"
+    
+    # Preferencia de entrega
+    message += f"🚚 *Entrega:* {lead_info.get('delivery', 'No especificado')}\n\n"
+    
+    # Últimos mensajes de la conversación
+    message += f"💬 *ÚLTIMOS MENSAJES:*\n"
+    if 'conversation_history' in lead_info:
+        for i, (msg, bot_resp) in enumerate(lead_info['conversation_history'][:3]):
+            message += f"👤 Cliente: {msg[:50]}{'...' if len(msg) > 50 else ''}\n"
+            message += f"🤖 Bot: {bot_resp[:50]}{'...' if len(bot_resp) > 50 else ''}\n\n"
+    
+    message += f"💬 *¡CONTACTAR CLIENTE AHORA!*\n"
+    message += f"📞 Llamar: {lead_info['phone']}\n"
+    message += f"📱 WhatsApp: wa.me/591{lead_info['phone']}"
     
     # Opción 1: WhatsApp Business API gratuito (ultramsg.com)
     try:
         ultramsg_token = os.getenv('ULTRAMSG_TOKEN', '')
         ultramsg_instance = os.getenv('ULTRAMSG_INSTANCE', '')
+        
+        logging.info(f"🔍 DEBUG - UltraMsg Token: {'✅ Configurado' if ultramsg_token else '❌ No encontrado'}")
+        logging.info(f"🔍 DEBUG - UltraMsg Instance: {'✅ Configurado' if ultramsg_instance else '❌ No encontrado'}")
         
         if ultramsg_token and ultramsg_instance:
             url = f"https://api.ultramsg.com/{ultramsg_instance}/messages/chat"
@@ -149,14 +192,23 @@ def send_whatsapp_notification(lead_info):
                 "body": message
             }
             
-            response = requests.post(url, data=payload)
+            logging.info(f"📤 Intentando enviar WhatsApp a: {owner_phone}")
+            logging.info(f"📤 URL: {url}")
+            
+            response = requests.post(url, data=payload, timeout=10)
+            logging.info(f"📥 Respuesta UltraMsg: Status {response.status_code} - {response.text}")
+            
             if response.status_code == 200:
                 logging.info(f"✅ Notificación WhatsApp enviada exitosamente")
                 return True
             else:
-                logging.warning(f"Error enviando WhatsApp via UltraMsg: {response.status_code}")
+                logging.warning(f"❌ Error enviando WhatsApp via UltraMsg: {response.status_code} - {response.text}")
+        else:
+            logging.warning(f"⚠️ Variables UltraMsg no configuradas en el servidor")
     except Exception as e:
-        logging.error(f"Error enviando notificación WhatsApp: {e}")
+        logging.error(f"💥 Error enviando notificación WhatsApp: {e}")
+        import traceback
+        logging.error(f"💥 Traceback: {traceback.format_exc()}")
     
     # Opción 2: CallMeBot (backup)
     try:
@@ -202,11 +254,56 @@ def save_lead(user_id, phone_number, products_interested):
         conn.commit()
         logging.info(f"Lead capturado - User: {user_id}, Phone: {phone_number}, Products: {products_interested}")
         
+        # Obtener información detallada de la conversación
+        cursor.execute('''
+            SELECT message, bot_response FROM conversations 
+            WHERE user_id = ? ORDER BY timestamp DESC LIMIT 10
+        ''', (user_id,))
+        conversation_history = cursor.fetchall()
+        
+        # Obtener información de productos con precios
+        products = get_active_products()
+        order_details = []
+        total_estimated = 0
+        
+        for product_key in products_interested:
+            if product_key in products:
+                product_info = products[product_key]
+                order_details.append({
+                    'name': product_info['name'],
+                    'price': product_info['price'],
+                    'key': product_key,
+                    'product_info': product_info
+                })
+                total_estimated += product_info['price']  # Estimado para 1 unidad
+        
+        # Detectar cantidad mencionada en la conversación
+        quantity_detected = None
+        delivery_preference = "No especificado"
+        
+        for msg, bot_resp in conversation_history:
+            # Detectar cantidad
+            qty = detect_quantity(msg)
+            if qty and not quantity_detected:
+                quantity_detected = qty
+            
+            # Detectar preferencia de entrega
+            msg_lower = msg.lower()
+            if any(keyword in msg_lower for keyword in ['envio', 'delivery', 'entregar']):
+                delivery_preference = "Delivery"
+            elif any(keyword in msg_lower for keyword in ['recoger', 'pasar a recoger', 'recojo']):
+                delivery_preference = "Recoger en almacén"
+        
         # Enviar notificación a WhatsApp del dueño
         lead_info = {
             'phone': phone_number,
             'products': products_interested,
-            'user_id': user_id
+            'user_id': user_id,
+            'order_details': order_details,
+            'quantity': quantity_detected,
+            'delivery': delivery_preference,
+            'total_estimated': total_estimated,
+            'conversation_history': conversation_history[:5]  # Últimas 5 interacciones
         }
         send_whatsapp_notification(lead_info)
         
@@ -216,12 +313,14 @@ def save_lead(user_id, phone_number, products_interested):
         conn.close()
 
 def get_active_products():
-    """Obtener productos activos y en stock desde la base de datos"""
+    """Obtener productos activos y en stock desde la base de datos con información de promociones"""
     conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
     
     cursor.execute('''
-        SELECT key_name, name, price, stock, keywords, description 
+        SELECT key_name, name, price, stock, keywords, description,
+               discount_enabled, discount_name, discount_min_quantity, 
+               discount_percentage, discount_description, bulk_discounts
         FROM products 
         WHERE active = TRUE AND stock > 0
         ORDER BY name
@@ -229,13 +328,19 @@ def get_active_products():
     
     products = {}
     for row in cursor.fetchall():
-        key_name, name, price, stock, keywords, description = row
+        key_name, name, price, stock, keywords, description, discount_enabled, discount_name, discount_min_qty, discount_pct, discount_desc, bulk_discounts = row
         products[key_name] = {
             'name': name,
             'price': price,
             'stock': stock,
             'keywords': keywords.split(','),
-            'description': description
+            'description': description,
+            'discount_enabled': bool(discount_enabled),
+            'discount_name': discount_name or '',
+            'discount_min_quantity': discount_min_qty or 3,
+            'discount_percentage': discount_pct or 0,
+            'discount_description': discount_desc or '',
+            'bulk_discounts': bulk_discounts or '{}'
         }
     
     conn.close()
@@ -334,6 +439,46 @@ def send_facebook_message(recipient_id, message_text):
         logging.error(f"Excepción enviando mensaje a Facebook: {e}")
         return False
 
+def send_whatsapp_response(recipient_phone, message_text):
+    """Enviar mensaje de respuesta a WhatsApp via UltraMsg"""
+    try:
+        ultramsg_token = os.getenv('ULTRAMSG_TOKEN', '')
+        ultramsg_instance = os.getenv('ULTRAMSG_INSTANCE', '')
+        
+        if not ultramsg_token or not ultramsg_instance:
+            logging.warning("⚠️ UltraMsg no configurado para enviar respuestas")
+            return False
+        
+        # Asegurar formato correcto del número
+        clean_phone = recipient_phone.replace('+', '').replace(' ', '').replace('-', '')
+        if not clean_phone.startswith('591'):
+            clean_phone = '591' + clean_phone
+            
+        url = f"https://api.ultramsg.com/{ultramsg_instance}/messages/chat"
+        payload = {
+            "token": ultramsg_token,
+            "to": clean_phone,
+            "body": message_text
+        }
+        
+        logging.info(f"📤 Enviando respuesta WhatsApp a: {clean_phone}")
+        
+        response = requests.post(url, data=payload, timeout=10)
+        
+        if response.status_code == 200:
+            response_data = response.json()
+            logging.info(f"✅ Respuesta WhatsApp enviada exitosamente: {response_data}")
+            return True
+        else:
+            logging.error(f"❌ Error enviando respuesta WhatsApp: {response.status_code} - {response.text}")
+            return False
+            
+    except Exception as e:
+        logging.error(f"💥 Error enviando respuesta WhatsApp: {e}")
+        import traceback
+        logging.error(f"💥 Traceback: {traceback.format_exc()}")
+        return False
+
 def detect_gender_from_conversations(user_id):
     """Detectar género basado en nombres mencionados en conversaciones"""
     conn = sqlite3.connect(DATABASE)
@@ -396,28 +541,55 @@ def get_gendered_greeting(user_id):
     else:
         return 'estimado(a)'  # Default si no se puede determinar
 
-def calculate_discount_and_total(quantity, unit_price):
-    """Calcular descuento y total basado en cantidad"""
-    if quantity <= 2:
-        discount_percent = 0
-        discount_amount = 0
-    elif quantity == 3:
-        # Precio especial: 3 tapper = 95bs
-        total_normal = quantity * unit_price  # 105bs
-        discount_amount = total_normal - 95   # 10bs
-        discount_percent = 10
-    elif quantity in [4, 5]:
-        # Mantener el mismo descuento proporcional
-        discount_amount = 15
-        discount_percent = 10
-    elif quantity == 6:
-        discount_percent = 8
-        discount_amount = (quantity * unit_price) * (discount_percent / 100)
-    else:  # 7 o más (no especificado en el nuevo flujo)
-        discount_percent = 10
-        discount_amount = (quantity * unit_price) * (discount_percent / 100)
+def calculate_discount_and_total(quantity, unit_price, product_info=None):
+    """Calcular descuento y total basado en cantidad y configuración del producto"""
     
+    # Si no hay información del producto o no tiene descuentos habilitados, no aplicar descuento
+    if not product_info or not product_info.get('discount_enabled', False):
+        subtotal = quantity * unit_price
+        return {
+            'discount_percent': 0,
+            'discount_amount': 0,
+            'subtotal': subtotal,
+            'total': round(subtotal),
+            'has_discount': False
+        }
+    
+    # Verificar si alcanza la cantidad mínima para descuento
+    min_quantity = product_info.get('discount_min_quantity', 3)
+    if quantity < min_quantity:
+        subtotal = quantity * unit_price
+        return {
+            'discount_percent': 0,
+            'discount_amount': 0,
+            'subtotal': subtotal,
+            'total': round(subtotal),
+            'has_discount': False
+        }
+    
+    # Obtener descuentos escalonados desde la base de datos
+    try:
+        import json
+        bulk_discounts = json.loads(product_info.get('bulk_discounts', '{}'))
+    except:
+        bulk_discounts = {}
+    
+    # Determinar el descuento aplicable
+    discount_percent = 0
+    
+    # Buscar el descuento más alto aplicable para la cantidad
+    for qty_str, discount in bulk_discounts.items():
+        qty_threshold = int(qty_str)
+        if quantity >= qty_threshold:
+            discount_percent = max(discount_percent, discount)
+    
+    # Si no hay descuentos escalonados, usar el descuento base
+    if discount_percent == 0:
+        discount_percent = product_info.get('discount_percentage', 0)
+    
+    # Calcular totales
     subtotal = quantity * unit_price
+    discount_amount = (subtotal * discount_percent) / 100
     total = subtotal - discount_amount
     
     return {
@@ -457,7 +629,7 @@ def get_bot_response(user_id, message):
                 products_mentioned.append(product_key)
         
         save_lead(user_id, phone, products_mentioned)
-        return "te escribo", phone
+        return "Perfecto! Para coordinar entrega, escribeme por WhatsApp: wa.me/59178056048 📱", phone
     
     # Analizar contexto conversacional
     last_bot_response = previous_conversations[0][1] if previous_conversations else ""
@@ -484,7 +656,7 @@ def get_bot_response(user_id, message):
         if last_product:
             # Si mencionó cantidad específica en la negociación
             if quantity_in_negotiation:
-                calc = calculate_discount_and_total(quantity_in_negotiation, last_product['price'])
+                calc = calculate_discount_and_total(quantity_in_negotiation, last_product['price'], last_product)
                 gendered_greeting = get_gendered_greeting(user_id)
                 if calc['has_discount']:
                     return f"Nada menos {gendered_greeting}, pero si lleva {quantity_in_negotiation} le hago {calc['discount_percent']}% descuento = {calc['total']}bs con envío gratis hasta el cuarto anillo", None
@@ -492,12 +664,12 @@ def get_bot_response(user_id, message):
                     return f"Nada menos {gendered_greeting}, {quantity_in_negotiation} unidades = {calc['total']}bs con envío gratis hasta el cuarto anillo", None
             else:
                 # Ofrecer la mejor opción (3 unidades con 5% descuento)
-                calc = calculate_discount_and_total(3, last_product['price'])
+                calc = calculate_discount_and_total(3, last_product['price'], last_product)
                 gendered_greeting = get_gendered_greeting(user_id)
-                return f"Nada menos {gendered_greeting}, pero si lleva 3 le hago descuento de 10bs = 95bs", None
+                return f"Nada menos {gendered_greeting}, pero si lleva 3 le hago {calc['discount_percent']}% descuento = {calc['total']}bs", None
         else:
             gendered_greeting = get_gendered_greeting(user_id)
-            return f"Nada menos {gendered_greeting}, los descuentos se aplican a partir de:\n3 tapper a 95bs = descuento de 10bs", None
+            return f"Nada menos {gendered_greeting}, los descuentos se aplican a partir de 3 unidades:\n• 3 unidades: 10% descuento\n• 4-5 unidades: 12% descuento\n• 6+ unidades: 15% descuento", None
     
     # Detectar preguntas sobre delivery/entrega
     delivery_keywords = ['entrega', 'delivery', 'domicilio', 'entregan', 'envio', 'envío', 'traen']
@@ -548,22 +720,22 @@ def get_bot_response(user_id, message):
                 break
         
         if last_product:
-            calc = calculate_discount_and_total(quantity, last_product['price'])
+            calc = calculate_discount_and_total(quantity, last_product['price'], last_product)
             
             if quantity == 1:
                 return f"esta bien, si gusta puedo hacerle el envio o puede pasar a recogerlo", None
             elif calc['has_discount']:
                 # Verificar si es una consulta o compra definitiva
                 if is_quantity_inquiry(message):
-                    return f"{quantity} tapper en {calc['total']}bs con descuento de {calc['discount_amount']}bs", None
+                    return f"{quantity} {last_product['name'].lower()} en {calc['total']}bs con descuento de {calc['discount_amount']}bs", None
                 else:
-                    return f"ok si quiere {quantity} te hago un descuento de {calc['discount_amount']}bs, {quantity} tapper en {calc['total']}bs. Deme su teléfono", None
+                    return f"ok si quiere {quantity} te hago un descuento de {calc['discount_amount']}bs, {quantity} {last_product['name'].lower()} en {calc['total']}bs. Deme su teléfono", None
             else:
                 # Sin descuento (2 unidades) - mencionar descuento disponible
                 if is_quantity_inquiry(message):
-                    return f"Ok, {quantity} tapper en {calc['total']}bs con envío gratis hasta el cuarto anillo, se aplica descuento apartir de 3 unidades", None
+                    return f"Ok, {quantity} {last_product['name'].lower()} en {calc['total']}bs con envío gratis hasta el cuarto anillo, se aplica descuento apartir de 3 unidades", None
                 else:
-                    return f"Ok, {quantity} tapper en {calc['total']}bs con envío gratis hasta el cuarto anillo, se aplica descuento apartir de 3 unidades. Deme su teléfono", None
+                    return f"Ok, {quantity} {last_product['name'].lower()} en {calc['total']}bs con envío gratis hasta el cuarto anillo, se aplica descuento apartir de 3 unidades. Deme su teléfono", None
         else:
             return "Ok. Deme su teléfono para coordinar", None
     
@@ -665,6 +837,52 @@ def webhook():
                                 return jsonify({'status': 'success', 'response': bot_response})
         
         return jsonify({'status': 'success'})
+
+@app.route('/whatsapp_webhook', methods=['GET', 'POST'])
+def whatsapp_webhook():
+    """Webhook para WhatsApp via UltraMsg"""
+    
+    if request.method == 'GET':
+        # Verificación opcional del webhook
+        return "WhatsApp webhook activo", 200
+    
+    elif request.method == 'POST':
+        # Procesar mensaje entrante de WhatsApp
+        data = request.get_json()
+        logging.info(f"📱 Mensaje WhatsApp recibido: {data}")
+        
+        try:
+            # Extraer información del mensaje de UltraMsg
+            if 'data' in data and 'body' in data['data']:
+                message_data = data['data']
+                sender_phone = message_data.get('from', '').replace('@c.us', '')
+                message_text = message_data.get('body', '')
+                
+                # Limpiar número de teléfono (remover código de país si existe)
+                if sender_phone.startswith('591'):
+                    sender_phone = sender_phone[3:]  # Remover 591
+                
+                logging.info(f"📱 WhatsApp - De: {sender_phone}, Mensaje: {message_text}")
+                
+                # Generar respuesta usando la misma lógica
+                bot_response, phone = get_bot_response(sender_phone, message_text)
+                
+                # Guardar conversación
+                save_conversation(sender_phone, message_text, bot_response, phone)
+                
+                # Enviar respuesta a WhatsApp
+                send_whatsapp_response(sender_phone, bot_response)
+                
+                logging.info(f"📱 WhatsApp respuesta enviada: {bot_response}")
+                
+                return jsonify({'status': 'success', 'response': bot_response})
+                
+        except Exception as e:
+            logging.error(f"❌ Error procesando mensaje WhatsApp: {e}")
+            import traceback
+            logging.error(f"❌ Traceback: {traceback.format_exc()}")
+        
+        return jsonify({'status': 'received'})
 
 @app.route('/test', methods=['GET', 'POST'])
 def test():
@@ -916,6 +1134,93 @@ def test_response():
         'phone': phone
     })
 
+@app.route('/test_whatsapp', methods=['GET', 'POST'])
+def test_whatsapp():
+    """Endpoint para probar WhatsApp localmente"""
+    if request.method == 'GET':
+        return render_template_string('''
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Test WhatsApp Bot</title>
+            <style>
+                body { font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; }
+                .chat-container { border: 1px solid #25D366; height: 400px; overflow-y: auto; padding: 10px; margin-bottom: 10px; background: #ECE5DD; }
+                .user-message { text-align: right; margin: 5px 0; background: #DCF8C6; padding: 8px; border-radius: 10px; max-width: 80%; margin-left: auto; }
+                .bot-message { text-align: left; margin: 5px 0; background: white; padding: 8px; border-radius: 10px; max-width: 80%; }
+                input[type="text"] { width: 70%; padding: 10px; border: 1px solid #25D366; border-radius: 20px; }
+                button { padding: 10px 20px; background: #25D366; color: white; border: none; border-radius: 20px; cursor: pointer; }
+                .phone-input { width: 25%; padding: 10px; border: 1px solid #ccc; border-radius: 20px; margin-right: 10px; }
+            </style>
+        </head>
+        <body>
+            <h1>🟢 Test WhatsApp Bot</h1>
+            <div class="chat-container" id="chatContainer">
+                <div style="text-align: center; color: #666; margin: 20px;">
+                    Simula conversaciones de WhatsApp aquí
+                </div>
+            </div>
+            <input type="text" class="phone-input" id="phoneInput" placeholder="Teléfono (ej: 78056048)" value="78056048">
+            <input type="text" id="messageInput" placeholder="Escribe tu mensaje..." onkeypress="handleEnter(event)">
+            <button onclick="sendMessage()">📱 Enviar</button>
+            
+            <script>
+                function sendMessage() {
+                    const phoneInput = document.getElementById('phoneInput');
+                    const messageInput = document.getElementById('messageInput');
+                    const phone = phoneInput.value.trim();
+                    const message = messageInput.value.trim();
+                    if (!message || !phone) return;
+                    
+                    // Mostrar mensaje del usuario
+                    addMessage('user', message, phone);
+                    messageInput.value = '';
+                    
+                    // Enviar al bot
+                    fetch('/test_whatsapp', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({message: message, phone: phone})
+                    })
+                    .then(response => response.json())
+                    .then(data => {
+                        addMessage('bot', data.response, 'Bot');
+                    })
+                    .catch(error => {
+                        addMessage('bot', 'Error: ' + error, 'Bot');
+                    });
+                }
+                
+                function addMessage(type, text, sender) {
+                    const container = document.getElementById('chatContainer');
+                    const div = document.createElement('div');
+                    div.className = type + '-message';
+                    div.innerHTML = `<strong>${sender}:</strong> ${text}`;
+                    container.appendChild(div);
+                    container.scrollTop = container.scrollHeight;
+                }
+                
+                function handleEnter(event) {
+                    if (event.key === 'Enter') {
+                        sendMessage();
+                    }
+                }
+            </script>
+        </body>
+        </html>
+        ''')
+    
+    elif request.method == 'POST':
+        data = request.get_json()
+        message = data.get('message', '')
+        phone = data.get('phone', 'test_phone')
+        
+        # Simular proceso de WhatsApp
+        bot_response, detected_phone = get_bot_response(phone, message)
+        save_conversation(phone, message, bot_response, detected_phone)
+        
+        return jsonify({'response': bot_response, 'phone': detected_phone})
+
 @app.route('/products')
 def products():
     """Panel de gestión de productos"""
@@ -923,7 +1228,9 @@ def products():
     cursor = conn.cursor()
     
     cursor.execute('''
-        SELECT id, name, key_name, price, stock, keywords, description, active 
+        SELECT id, name, key_name, price, stock, keywords, description, active,
+               discount_enabled, discount_name, discount_min_quantity, 
+               discount_percentage, discount_description, bulk_discounts
         FROM products 
         ORDER BY name
     ''')
@@ -1014,6 +1321,53 @@ def products():
                     <label>Descripción:</label>
                     <textarea id="productDescription" name="description"></textarea>
                 </div>
+                
+                <!-- Sección de Promociones -->
+                <div style="border: 2px solid #007bff; padding: 15px; border-radius: 8px; margin: 20px 0; background: #f8f9ff;">
+                    <h4 style="color: #007bff; margin-top: 0;">🎯 Configuración de Promociones</h4>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>
+                                <input type="checkbox" id="discountEnabled" name="discount_enabled" value="1">
+                                Habilitar promociones para este producto
+                            </label>
+                        </div>
+                    </div>
+                    <div id="promotionFields" style="display: none;">
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>Nombre de la Promoción:</label>
+                                <input type="text" id="discountName" name="discount_name" placeholder="Ej: ¡Compra más, ahorra más!">
+                            </div>
+                            <div class="form-group">
+                                <label>Cantidad Mínima:</label>
+                                <input type="number" id="discountMinQuantity" name="discount_min_quantity" value="3" min="2">
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>Descuento Base (%):</label>
+                                <input type="number" id="discountPercentage" name="discount_percentage" step="0.1" min="0" max="100" value="10">
+                            </div>
+                            <div class="form-group">
+                                <label>Descuentos Escalonados (JSON):</label>
+                                <input type="text" id="bulkDiscounts" name="bulk_discounts" placeholder='{"3": 10, "5": 15, "10": 20}' style="font-family: monospace;">
+                                <small style="color: #666;">Formato: {"cantidad": descuento_porcentaje}</small>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>Descripción de la Promoción:</label>
+                            <textarea id="discountDescription" name="discount_description" placeholder="Describe los beneficios de la promoción"></textarea>
+                        </div>
+                        <div style="background: #e7f3ff; padding: 10px; border-radius: 5px; margin-top: 10px;">
+                            <h5>💡 Ejemplos de Promociones Exitosas:</h5>
+                            <button type="button" onclick="applyPromoTemplate('volume')" class="btn" style="background: #17a2b8; color: white; margin: 2px;">Descuento por Volumen</button>
+                            <button type="button" onclick="applyPromoTemplate('seasonal')" class="btn" style="background: #28a745; color: white; margin: 2px;">Promoción Estacional</button>
+                            <button type="button" onclick="applyPromoTemplate('clearance')" class="btn" style="background: #ffc107; color: black; margin: 2px;">Liquidación</button>
+                        </div>
+                    </div>
+                </div>
+                
                 <div class="form-row">
                     <button type="submit" class="btn btn-success">Guardar Producto</button>
                     <button type="button" onclick="clearForm()" class="btn">Cancelar</button>
@@ -1028,6 +1382,7 @@ def products():
                 <th>Precio</th>
                 <th>Stock</th>
                 <th>Estado</th>
+                <th>Promoción</th>
                 <th>Palabras Clave</th>
                 <th>Acciones</th>
             </tr>
@@ -1042,9 +1397,17 @@ def products():
                 <td class="{% if product[7] %}status-active{% else %}status-inactive{% endif %}">
                     {{ 'Activo' if product[7] else 'Inactivo' }}
                 </td>
+                <td class="{% if product[8] %}status-active{% else %}status-inactive{% endif %}">
+                    {% if product[8] %}
+                        <span style="color: green;">&#x2713;</span> {{ product[9] or 'Promoción activa' }}<br>
+                        <small>Min: {{ product[10] }} - {{ product[11] }}%</small>
+                    {% else %}
+                        <span style="color: red;">&#x2717;</span> Sin promoción
+                    {% endif %}
+                </td>
                 <td>{{ product[5] }}</td>
                 <td>
-                    <button onclick="editProduct({{ product[0] }}, '{{ product[1] }}', '{{ product[2] }}', {{ product[3] }}, {{ product[4] }}, '{{ product[5] }}', '{{ product[6] or '' }}', {{ product[7] }})" class="btn btn-warning">Editar</button>
+                    <button onclick="editProduct({{ product[0] }}, '{{ product[1] }}', '{{ product[2] }}', {{ product[3] }}, {{ product[4] }}, '{{ product[5] }}', '{{ product[6] or '' }}', {{ product[7] }}, {{ product[8] or 0 }}, '{{ product[9] or '' }}', {{ product[10] or 3 }}, {{ product[11] or 0 }}, '{{ product[12] or '' }}', '{{ product[13] or '' }}')" class="btn btn-warning">Editar</button>
                     <button onclick="deleteProduct({{ product[0] }})" class="btn btn-danger">Eliminar</button>
                 </td>
             </tr>
@@ -1063,7 +1426,7 @@ def products():
                 document.getElementById('productForm').style.display = 'none';
             }
 
-            function editProduct(id, name, key, price, stock, keywords, description, active) {
+            function editProduct(id, name, key, price, stock, keywords, description, active, discountEnabled, discountName, discountMinQty, discountPct, discountDesc, bulkDiscounts) {
                 document.getElementById('productId').value = id;
                 document.getElementById('productName').value = name;
                 document.getElementById('productKey').value = key;
@@ -1072,6 +1435,16 @@ def products():
                 document.getElementById('productKeywords').value = keywords;
                 document.getElementById('productDescription').value = description;
                 document.getElementById('productActive').value = active ? '1' : '0';
+                
+                // Campos de promoción
+                document.getElementById('discountEnabled').checked = Boolean(discountEnabled);
+                document.getElementById('discountName').value = discountName || '';
+                document.getElementById('discountMinQuantity').value = discountMinQty || 3;
+                document.getElementById('discountPercentage').value = discountPct || 10;
+                document.getElementById('discountDescription').value = discountDesc || '';
+                document.getElementById('bulkDiscounts').value = bulkDiscounts || '{}';
+                
+                togglePromotionFields();
                 document.getElementById('productForm').style.display = 'block';
             }
 
@@ -1180,8 +1553,53 @@ def products():
                 document.getElementById('productKeywords').value = suggestedKeywords.join(', ');
                 
                 // Mostrar mensaje de confirmación
-                alert('✅ Se generaron ' + suggestedKeywords.length + ' palabras clave automáticamente. Puedes editarlas si necesitas.');
+                alert('Se generaron ' + suggestedKeywords.length + ' palabras clave automaticamente. Puedes editarlas si necesitas.');
             }
+
+            // Funciones para promociones
+            function togglePromotionFields() {
+                const enabled = document.getElementById('discountEnabled').checked;
+                const fields = document.getElementById('promotionFields');
+                fields.style.display = enabled ? 'block' : 'none';
+            }
+
+            function applyPromoTemplate(type) {
+                const templates = {
+                    volume: {
+                        name: 'Descuento por Volumen',
+                        minQty: 3,
+                        percentage: 10,
+                        description: 'Compra mas, ahorra mas. Descuentos especiales por cantidad.',
+                        bulkDiscounts: '{"3": 10, "5": 15, "10": 20}'
+                    },
+                    seasonal: {
+                        name: 'Promocion de Temporada',
+                        minQty: 2,
+                        percentage: 15,
+                        description: 'Promocion especial por tiempo limitado.',
+                        bulkDiscounts: '{"2": 15, "4": 20, "6": 25}'
+                    },
+                    clearance: {
+                        name: 'Liquidacion',
+                        minQty: 1,
+                        percentage: 25,
+                        description: 'Liquidacion de inventario. Precios increibles.',
+                        bulkDiscounts: '{"1": 25, "3": 30, "5": 35}'
+                    }
+                };
+
+                const template = templates[type];
+                if (template) {
+                    document.getElementById('discountName').value = template.name;
+                    document.getElementById('discountMinQuantity').value = template.minQty;
+                    document.getElementById('discountPercentage').value = template.percentage;
+                    document.getElementById('discountDescription').value = template.description;
+                    document.getElementById('bulkDiscounts').value = template.bulkDiscounts;
+                }
+            }
+
+            // Event listeners
+            document.getElementById('discountEnabled').addEventListener('change', togglePromotionFields);
         </script>
     </body>
     </html>
@@ -1200,8 +1618,10 @@ def api_products():
         cursor = conn.cursor()
         
         cursor.execute('''
-            INSERT INTO products (name, key_name, price, stock, keywords, description, active)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO products (name, key_name, price, stock, keywords, description, active,
+                                discount_enabled, discount_name, discount_min_quantity, 
+                                discount_percentage, discount_description, bulk_discounts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             data['name'], 
             data['key_name'], 
@@ -1209,7 +1629,13 @@ def api_products():
             int(data['stock']),
             data['keywords'], 
             data.get('description', ''),
-            bool(int(data.get('active', 1)))
+            bool(int(data.get('active', 1))),
+            bool(data.get('discount_enabled', False)),
+            data.get('discount_name', ''),
+            int(data.get('discount_min_quantity', 3)),
+            float(data.get('discount_percentage', 0)),
+            data.get('discount_description', ''),
+            data.get('bulk_discounts', '{}')
         ))
         
         conn.commit()
@@ -1228,7 +1654,10 @@ def api_product_detail(product_id):
         data = request.get_json()
         cursor.execute('''
             UPDATE products 
-            SET name=?, key_name=?, price=?, stock=?, keywords=?, description=?, active=?, updated_at=CURRENT_TIMESTAMP
+            SET name=?, key_name=?, price=?, stock=?, keywords=?, description=?, active=?, 
+                discount_enabled=?, discount_name=?, discount_min_quantity=?, 
+                discount_percentage=?, discount_description=?, bulk_discounts=?, 
+                updated_at=CURRENT_TIMESTAMP
             WHERE id=?
         ''', (
             data['name'], 
@@ -1238,6 +1667,12 @@ def api_product_detail(product_id):
             data['keywords'], 
             data.get('description', ''),
             bool(int(data.get('active', 1))),
+            bool(data.get('discount_enabled', False)),
+            data.get('discount_name', ''),
+            int(data.get('discount_min_quantity', 3)),
+            float(data.get('discount_percentage', 0)),
+            data.get('discount_description', ''),
+            data.get('bulk_discounts', '{}'),
             product_id
         ))
         
